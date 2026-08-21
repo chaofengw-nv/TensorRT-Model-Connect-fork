@@ -422,9 +422,9 @@ bool batched_prefill_supported(const TrtModule* prefill, const QwenTextGenConfig
     return dynamic_cast<QwenKvCache*>(state) != nullptr;
 }
 
-void validate_generation_capacity(const std::vector<int32_t>& input_ids, int32_t max_new_tokens,
-                                  QwenInferenceState* state, const TrtModule* prefill,
-                                  const TrtModule* decoder) {
+void validate_generation_capacity(const std::vector<int32_t>& input_ids,
+                                  int32_t generation_cache_rows, QwenInferenceState* state,
+                                  const TrtModule* prefill, const TrtModule* decoder) {
     const TrtModule* module = prefill;
     if (module == nullptr)
         module = decoder;
@@ -438,8 +438,8 @@ void validate_generation_capacity(const std::vector<int32_t>& input_ids, int32_t
 
     const auto capacity = static_cast<std::size_t>(kv->max_length());
     if (input_ids.size() > capacity ||
-        (max_new_tokens > 0 &&
-         static_cast<std::size_t>(max_new_tokens) > capacity - input_ids.size())) {
+        (generation_cache_rows > 0 &&
+         static_cast<std::size_t>(generation_cache_rows) > capacity - input_ids.size())) {
         throw std::runtime_error(
             "Qwen requested prompt and generation exceed the model's fixed KV cache capacity");
     }
@@ -848,10 +848,13 @@ QwenTextGenerationPipeline::TimedGenResult QwenTextGenerationPipeline::generate_
     using Clock = std::chrono::steady_clock;
     if (max_new_tokens == 0 || input_ids.empty())
         return TimedGenResult{input_ids, 0.0, 0.0};
-    validate_generation_capacity(input_ids, max_new_tokens, state_.get(), prefill_.get(),
-                                 decoders_.front().module.get());
 
     const std::string mode = resolve_generation_mode(cfg);
+    const bool autoregressive = mode == "auto" || mode == "ar";
+    const int32_t generation_cache_rows =
+        autoregressive ? std::max(max_new_tokens - 1, 0) : max_new_tokens;
+    validate_generation_capacity(input_ids, generation_cache_rows, state_.get(), prefill_.get(),
+                                 decoders_.front().module.get());
     if (mode == "diffusion" || mode == "dlm")
         return generate_diffusion_from_ids(input_ids, max_new_tokens, params, cfg);
     if (mode == "linear_spec" || mode == "linear_spec_lora")

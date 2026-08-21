@@ -215,7 +215,7 @@ bool rejects_native_contract(cudaStream_t stream, Mutate mutate) {
 }
 
 template <typename Pipeline, typename Cache, typename Config>
-int run_native_kv_contract_tests(const char* model) {
+int run_native_kv_contract_tests(const char* model, int32_t generated_tokens_without_kv = 0) {
     int failures = 0;
     const auto check = [&](bool condition, const std::string& message) {
         if (!condition) {
@@ -349,6 +349,33 @@ int run_native_kv_contract_tests(const char* model) {
               "final prefill row supplies EOS without an extra decode");
     }
 
+    if (generated_tokens_without_kv > 0) {
+        auto prefill_trace = std::make_shared<NativeKvTrace>();
+        auto decode_trace = std::make_shared<NativeKvTrace>();
+        auto prefill = std::make_unique<NativeKvModuleStub>(stream, 1, 11, 1, 2, DType::kFloat16,
+                                                            true, prefill_trace);
+        auto decoder = std::make_unique<NativeKvModuleStub>(stream, 1, 11, 1, 2, DType::kFloat16,
+                                                            true, decode_trace);
+        auto cache = std::make_unique<Cache>(1, 11, 2, stream, DType::kFloat16);
+        Cache* cache_ptr = cache.get();
+        std::vector<typename Pipeline::DecoderContext> decoders;
+        decoders.push_back(typename Pipeline::DecoderContext{11, std::move(decoder)});
+        Pipeline pipeline(std::move(decoders), std::move(cache), make_config(), stream, nullptr, "",
+                          nullptr, std::move(prefill));
+        const std::vector<int32_t> full_prompt{10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20};
+
+        bool rejected = false;
+        typename Pipeline::GenerationResult result;
+        try {
+            result = pipeline.generate_ids(full_prompt, make_request(1));
+        } catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        check(!rejected && result.token_ids.size() == 12 && cache_ptr->position() == 11 &&
+                  decode_trace->calls.empty(),
+              "a full prompt can sample one token from prefill logits without another KV row");
+    }
+
     {
         auto prefill_trace = std::make_shared<NativeKvTrace>();
         auto decode_trace = std::make_shared<NativeKvTrace>();
@@ -364,7 +391,8 @@ int run_native_kv_contract_tests(const char* model) {
                           nullptr, std::move(prefill));
         bool overflow = false;
         try {
-            (void)pipeline.generate_ids(prompt, make_request(2));
+            (void)pipeline.generate_ids(
+                prompt, make_request(2 + generated_tokens_without_kv));
         } catch (const std::runtime_error&) {
             overflow = true;
         }
