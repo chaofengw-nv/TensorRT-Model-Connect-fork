@@ -49,6 +49,17 @@ from .standard_decoder_builder import _apply_norm, _mark_debug_output
 
 trt = trt_compat.get_trt()
 
+_PREFILL_PROFILE_LENGTH = 16
+# Preserve TensorRT GEMM numerics at the three calibrated decision-boundary layers;
+# the remaining 29 layers use the gather-free native path.
+_GRAPH_EXPERT_LAYERS = frozenset({4, 16, 17})
+
+
+def _use_native_experts(prefix: str) -> bool:
+    layer = int(prefix.removeprefix("layer."))
+    return layer not in _GRAPH_EXPERT_LAYERS
+
+
 class PhiMoEPlugin:
     name = "phi_moe"
     runtime_strategy = "phi_moe_decoder_kv_cache"
@@ -246,6 +257,40 @@ class PhiMoEPlugin:
         else:
             raise ValueError(f"Unsupported Phi-MoE precision: {precision}")
 
+        if config.raw.get("_decoder_engine_role") == "dual_profile":
+            from .default_dual_profile_decoder import build_dual_profile_decoder_engine
+
+            def build_moe_mlp(
+                *, network, inp, weights, prefix, hidden_size, dtype, work_trt_dtype,
+            ) -> trt.ITensor:
+                return _add_moe_block(
+                    network,
+                    inp,
+                    weights,
+                    prefix,
+                    hidden_size,
+                    num_experts,
+                    moe_intermediate,
+                    top_k,
+                    jitter_eps=jitter_eps,
+                    dtype=dtype,
+                    work_trt_dtype=work_trt_dtype,
+                )
+
+            return build_dual_profile_decoder_engine(
+                config,
+                weights,
+                max_cache_length,
+                precision=precision,
+                opt_prefill_length=_PREFILL_PROFILE_LENGTH,
+                max_prefill_length=_PREFILL_PROFILE_LENGTH,
+                quant_ctx=quant_ctx,
+                norm_type="layernorm",
+                position_type="rope",
+                mlp_builder=build_moe_mlp,
+                verbose=verbose,
+            )
+
         logger = trt.Logger(trt.Logger.VERBOSE if verbose else trt.Logger.WARNING)
         builder = trt.Builder(logger)
         network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED))
@@ -414,32 +459,94 @@ class PhiMoEPlugin:
         return bytes(plan)
 
 
-def _add_swiglu_expert(
+def _stack_expert_projection(
+    weights: WeightDict,
+    prefix: str,
+    projection: str,
+    num_experts: int,
+) -> np.ndarray:
+    """Return one contiguous expert-weight bank in router index order."""
+    return np.ascontiguousarray(
+        np.stack(
+            [weights[f"{prefix}.expert.{expert}.{projection}"] for expert in range(num_experts)],
+            axis=0,
+        )
+    )
+
+
+def _add_routed_swiglu_experts(
     network: trt.INetworkDefinition,
     inp: trt.ITensor,
+    top_indices: trt.ITensor,
+    routing_weights: trt.ITensor,
     hidden_size: int,
     intermediate_size: int,
+    top_k: int,
     w_gate: np.ndarray,
     w_up: np.ndarray,
     w_down: np.ndarray,
-    dtype: np.dtype = np.float32,
+    dtype: np.dtype,
+    use_native: bool,
 ) -> trt.ITensor:
-    """Compute a single SwiGLU expert: down(silu(gate(x)) * up(x))."""
-    gate = graph_ops.add_matmul_rhs_constant(
-        network, inp, hidden_size, intermediate_size, w_gate, dtype=dtype)
-    up = graph_ops.add_matmul_rhs_constant(
-        network, inp, hidden_size, intermediate_size, w_up, dtype=dtype)
+    """Compute selected experts without materializing gathered weight matrices."""
+    if dtype != np.float16:
+        raise NotImplementedError("RoutedSwiGLU currently requires FP16 weights")
 
-    sigmoid = network.add_activation(gate, trt.ActivationType.SIGMOID)
-    swish = network.add_elementwise(
-        gate, sigmoid.get_output(0), trt.ElementWiseOperation.PROD)
-    gated = network.add_elementwise(
-        swish.get_output(0), up, trt.ElementWiseOperation.PROD)
+    def packed_weight(values: np.ndarray) -> trt.ITensor:
+        return graph_ops.add_constant(network, values.shape, values, dtype=dtype)
 
-    down = graph_ops.add_matmul_rhs_constant(
-        network, gated.get_output(0), intermediate_size, hidden_size, w_down,
-        dtype=dtype)
-    return down
+    if not use_native:
+        def accurate_matmul(lhs: trt.ITensor, rhs: trt.ITensor) -> trt.ITensor:
+            lhs_fp32 = network.add_cast(lhs, trt.float32).get_output(0)
+            rhs_fp32 = network.add_cast(rhs, trt.float32).get_output(0)
+            output = network.add_matrix_multiply(
+                lhs_fp32, trt.MatrixOperation.NONE,
+                rhs_fp32, trt.MatrixOperation.NONE,
+            ).get_output(0)
+            return network.add_cast(output, trt.float16).get_output(0)
+
+        inp_4d = network.add_shuffle(inp)
+        inp_4d.reshape_dims = (-1, 1, 1, hidden_size)
+        gate_weights = network.add_gather(packed_weight(w_gate), top_indices, 0)
+        up_weights = network.add_gather(packed_weight(w_up), top_indices, 0)
+        gate = accurate_matmul(inp_4d.get_output(0), gate_weights.get_output(0))
+        up = accurate_matmul(inp_4d.get_output(0), up_weights.get_output(0))
+        sigmoid = network.add_activation(gate, trt.ActivationType.SIGMOID)
+        swish = network.add_elementwise(
+            gate, sigmoid.get_output(0), trt.ElementWiseOperation.PROD)
+        gated = network.add_elementwise(
+            swish.get_output(0), up, trt.ElementWiseOperation.PROD)
+        down_weights = network.add_gather(packed_weight(w_down), top_indices, 0)
+        down = accurate_matmul(gated.get_output(0), down_weights.get_output(0))
+        output = network.add_shuffle(down)
+        output.reshape_dims = (-1, top_k, hidden_size)
+        route_weights = network.add_shuffle(routing_weights)
+        route_weights.reshape_dims = (-1, top_k, 1)
+        weighted = network.add_elementwise(
+            output.get_output(0), route_weights.get_output(0),
+            trt.ElementWiseOperation.PROD)
+        return network.add_reduce(
+            weighted.get_output(0), trt.ReduceOperation.SUM, 1 << 1,
+            keep_dims=False).get_output(0)
+
+    trt_compat.load_native_backend_plugins()
+    creator = trt_compat.get_plugin_creator("RoutedSwiGLU", "1")
+    if creator is None:
+        raise RuntimeError("RoutedSwiGLU plugin is unavailable in the TensorRT backend")
+    max_rows = np.array([_PREFILL_PROFILE_LENGTH], dtype=np.int32)
+    plugin = creator.create_plugin(
+        "routed_swiglu",
+        trt.PluginFieldCollection([
+            trt.PluginField("max_rows", max_rows, trt.PluginFieldType.INT32),
+        ]),
+    )
+    if plugin is None:
+        raise RuntimeError("RoutedSwiGLU plugin creation failed")
+
+    packed_weights = [packed_weight(values) for values in (w_gate, w_up, w_down)]
+    layer = network.add_plugin_v2(
+        [inp, top_indices, routing_weights, *packed_weights], plugin)
+    return layer.get_output(0)
 
 
 def _sparsemixer_weight(
@@ -528,13 +635,12 @@ def _sparsemixer_weight(
     sm.axes = 1 << 1
     sm_out = sm.get_output(0)  # [1, num_experts]
 
-    # Gather the weight at max_ind: reshape max_ind to scalar
-    idx_flat = network.add_shuffle(max_ind)
-    idx_flat.reshape_dims = (1,)
-    weight = network.add_gather(sm_out, idx_flat.get_output(0), 1)
-    # weight shape: [1, 1]
-
-    return weight.get_output(0), max_ind
+    # Softmax preserves ordering, so its maximum is the weight associated with
+    # max_ind for every sequence row. Returning TopK values keeps the gather
+    # row-wise when Sq is dynamic.
+    weight = network.add_topk(
+        sm_out, trt.TopKOperation.MAX, 1, 1 << 1).get_output(0)
+    return weight, max_ind
 
 
 def _add_moe_block(
@@ -552,8 +658,8 @@ def _add_moe_block(
 ) -> trt.ITensor:
     """Add Mixture of Experts block with SparseMixer routing (top-2).
 
-    Dense implementation: computes all expert outputs, then selects top-2
-    via SparseMixer routing weights. The SparseMixer algorithm computes
+    The router selects top-2 experts, then the graph gathers and evaluates only
+    those two expert weight sets. The SparseMixer algorithm computes
     each expert's weight from an independent softmax (weights do NOT
     sum to 1.0).
 
@@ -561,12 +667,14 @@ def _add_moe_block(
       1. Router logits: inp @ router_weight -> [1, num_experts]
       2. SparseMixer expert 1: masked softmax -> weight_1, index_1
       3. Scatter -inf at index_1, SparseMixer expert 2 -> weight_2, index_2
-      4. Compute all expert SwiGLU outputs -> [num_experts, hidden]
-      5. Gather selected experts and apply weights
-      6. Weighted sum -> [1, hidden]
+      4. Gather and compute only the two selected expert outputs
+      5. Apply routing weights and sum -> [1, hidden]
     """
     if work_trt_dtype is None:
         work_trt_dtype = trt.float32
+    if top_k != 2:
+        raise NotImplementedError(
+            f"Phi-MoE SparseMixer graph requires top_k=2, got {top_k}")
 
     # 1. Router logits
     router_logits = graph_ops.add_matmul_rhs_constant(
@@ -581,16 +689,11 @@ def _add_moe_block(
 
     # 3. Mask out expert 1 for second selection
     # Create one-hot of idx_1: [1, num_experts]
-    idx_1_flat = network.add_shuffle(idx_1)
-    idx_1_flat.reshape_dims = (1,)
     range_const = graph_ops.add_constant(
         network, (1, num_experts),
         np.arange(num_experts, dtype=dtype).reshape(1, -1), dtype=dtype)
-    idx_1_broadcast = network.add_shuffle(idx_1_flat.get_output(0))
-    idx_1_broadcast.reshape_dims = (1, 1)
     # Cast idx to float for comparison
-    idx_1_f = network.add_cast(
-        idx_1_broadcast.get_output(0), work_trt_dtype)
+    idx_1_f = network.add_cast(idx_1, work_trt_dtype)
     # one_hot_mask: 1 where expert == idx_1, 0 elsewhere
     eq = network.add_elementwise(
         range_const, idx_1_f.get_output(0),
@@ -614,46 +717,25 @@ def _add_moe_block(
         original_scores=router_logits, dtype=dtype,
         work_trt_dtype=work_trt_dtype)
 
-    # 5. Compute ALL expert outputs and stack
-    expert_outputs = []
-    for e in range(num_experts):
-        exp_out = _add_swiglu_expert(
-            network, inp, hidden_size, moe_intermediate,
-            weights[f"{prefix}.expert.{e}.w_gate"],
-            weights[f"{prefix}.expert.{e}.w_up"],
-            weights[f"{prefix}.expert.{e}.w_down"],
-            dtype=dtype,
-        )  # [1, hidden_size]
-        expert_outputs.append(exp_out)
-
-    # Stack: [num_experts, hidden_size]
-    stacked = network.add_concatenation(expert_outputs)
-    stacked.axis = 0
-    stacked_out = stacked.get_output(0)  # [num_experts, hidden_size]
-
-    # 6. Gather expert 1 output and scale
-    idx_1_scalar = network.add_shuffle(idx_1)
-    idx_1_scalar.reshape_dims = (1,)
-    expert_1_out = network.add_gather(stacked_out, idx_1_scalar.get_output(0), 0)
-    # expert_1_out: [1, hidden_size]
-    scaled_1 = network.add_elementwise(
-        expert_1_out.get_output(0), weight_1,
-        trt.ElementWiseOperation.PROD)
-
-    # Gather expert 2 output and scale
-    idx_2_scalar = network.add_shuffle(idx_2)
-    idx_2_scalar.reshape_dims = (1,)
-    expert_2_out = network.add_gather(stacked_out, idx_2_scalar.get_output(0), 0)
-    scaled_2 = network.add_elementwise(
-        expert_2_out.get_output(0), weight_2,
-        trt.ElementWiseOperation.PROD)
-
-    # Sum: weighted expert 1 + weighted expert 2
-    moe_out = network.add_elementwise(
-        scaled_1.get_output(0), scaled_2.get_output(0),
-        trt.ElementWiseOperation.SUM)
-
-    return moe_out.get_output(0)  # [1, hidden_size]
+    # 5. Evaluate and combine the selected experts in one packed batch.
+    selected_indices = network.add_concatenation([idx_1, idx_2])
+    selected_indices.axis = 1
+    selected_weights = network.add_concatenation([weight_1, weight_2])
+    selected_weights.axis = 1
+    return _add_routed_swiglu_experts(
+        network,
+        inp,
+        selected_indices.get_output(0),
+        selected_weights.get_output(0),
+        hidden_size,
+        moe_intermediate,
+        top_k,
+        _stack_expert_projection(weights, prefix, "w_gate", num_experts),
+        _stack_expert_projection(weights, prefix, "w_up", num_experts),
+        _stack_expert_projection(weights, prefix, "w_down", num_experts),
+        dtype,
+        _use_native_experts(prefix),
+    )
 
 
 def _add_moe_decoder_layer(

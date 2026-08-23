@@ -134,13 +134,14 @@ def _load(arguments: argparse.Namespace) -> tuple[Any, Any, str]:
         }[arguments.task]
     model_options = {
         "torch_dtype": _dtype(torch, arguments.precision),
+        "device_map": "cuda:0",
         "low_cpu_mem_usage": True,
         **common,
     }
     if arguments.experts_implementation:
         model_options["experts_implementation"] = arguments.experts_implementation
     model = model_class.from_pretrained(arguments.model, **model_options)
-    model.eval().to("cuda")
+    model.eval()
     resolved_revision = str(
         getattr(model.config, "_commit_hash", None) or arguments.revision or "unresolved"
     )

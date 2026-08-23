@@ -49,6 +49,10 @@ pytest.importorskip("tensorrt_model_connect.config", reason="tensorrt_model_conn
 
 from tests.builder.family_plugin_tester import FamilyPluginTester
 from tests.builder.family_plugin_test_mixin import FamilyPluginTestMixin
+from tensorrt_model_connect.families.phi_moe.plugin import (
+    _stack_expert_projection,
+    _use_native_experts,
+)
 
 
 # Number of experts kept tiny for fast engine builds.
@@ -221,6 +225,32 @@ class TestPhiMoEEngine(FamilyPluginTestMixin):
         pass
 
     # --- Phi-MoE-specific Tier 1 tests ---
+
+    def test_expert_projection_bank_preserves_router_order(self):
+        weights = {
+            "layer.0.expert.0.w_gate": np.full((2, 3), 10, dtype=np.float32),
+            "layer.0.expert.1.w_gate": np.full((2, 3), 20, dtype=np.float32),
+            "layer.0.expert.2.w_gate": np.full((2, 3), 30, dtype=np.float32),
+        }
+
+        bank = _stack_expert_projection(weights, "layer.0", "w_gate", 3)
+
+        assert bank.shape == (3, 2, 3)
+        np.testing.assert_array_equal(bank[:, 0, 0], [10, 20, 30])
+        assert bank.flags.c_contiguous
+
+    @pytest.mark.parametrize(
+        ("layer", "expected"),
+        [
+            (0, True),
+            (4, False),
+            (16, False),
+            (17, False),
+            (31, True),
+        ],
+    )
+    def test_expert_execution_policy_preserves_calibrated_layers(self, layer, expected):
+        assert _use_native_experts(f"layer.{layer}") is expected
 
     def test_layernorm_biases_present(self, tester, tmp_path):
         """Validate that LayerNorm biases are loaded for all layers.

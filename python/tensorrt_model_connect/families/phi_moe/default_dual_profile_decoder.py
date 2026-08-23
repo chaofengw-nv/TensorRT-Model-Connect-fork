@@ -43,7 +43,7 @@ Tensor contract (matches the C++ runtime KvCache naming):
 from __future__ import annotations
 
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 from tensorrt_model_connect import trt_compat
@@ -127,10 +127,16 @@ def _gelu_fc_mlp(
 # ---------------------------------------------------------------------------
 
 
-def _supports_config(config: "ModelConfig", weights: "WeightDict") -> None:
+def _supports_config(
+    config: "ModelConfig",
+    weights: "WeightDict",
+    *,
+    allow_moe: bool = False,
+) -> None:
     """Reject configs the dual-profile builder cannot handle."""
     model_type = getattr(config, "model_type", "").lower()
-    if "moe" in model_type or "mamba" in model_type or "rwkv" in model_type:
+    if (("moe" in model_type and not allow_moe)
+            or "mamba" in model_type or "rwkv" in model_type):
         raise NotImplementedError(
             f"dual_profile_decoder_builder does not support model_type={model_type!r}")
     if "embedding" not in weights:
@@ -164,6 +170,7 @@ def build_dual_profile_decoder_engine(
     verbose: bool = False,
     dynamic_kv_profile_rows: list[int] | None = None,
     profile_mode: str = "dual_profile",
+    mlp_builder: Callable[..., trt.ITensor] | None = None,
 ) -> bytes:
     """Build a prefill/decode-capable dynamic-Sq decoder engine.
 
@@ -190,7 +197,7 @@ def build_dual_profile_decoder_engine(
     mode. In either mode, cache_k/cache_v inputs are declared dynamic when
     bucket profiles are requested so each profile can constrain their row count.
     """
-    _supports_config(config, weights)
+    _supports_config(config, weights, allow_moe=mlp_builder is not None)
     if profile_mode not in ("dual_profile", "prefill"):
         raise ValueError(
             "profile_mode must be 'dual_profile' or 'prefill', "
@@ -547,8 +554,18 @@ def build_dual_profile_decoder_engine(
                 weights.get(f"{prefix}.post_attn_norm_beta"),
                 eps_tensor, norm_type, work_np_dtype)
 
-        # MLP — SwiGLU (Llama-style) or GeluFC (GPT-2-style).
-        if mlp_type == "gelu_fc":
+        # MLP — family-owned callback, SwiGLU, or GeluFC.
+        if mlp_builder is not None:
+            mlp_out = mlp_builder(
+                network=network,
+                inp=norm2,
+                weights=weights,
+                prefix=prefix,
+                hidden_size=hidden,
+                dtype=work_np_dtype,
+                work_trt_dtype=work_trt_dtype,
+            )
+        elif mlp_type == "gelu_fc":
             mlp_out = _gelu_fc_mlp(
                 network, norm2,
                 matmul=matmul, weights=weights, prefix=prefix,

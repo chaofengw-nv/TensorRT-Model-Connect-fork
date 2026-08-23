@@ -570,6 +570,7 @@ if(TRTMC_BUILD_BACKEND_TRT AND _trtmc_can_build_trt_backend)
     target_sources(trtmc_backend_trt PRIVATE
       src/plugins/top4_logits_refinement_plugin.cpp
       src/plugins/top4_logits_refinement_kernel.cu
+      src/plugins/routed_swiglu_plugin.cu
     )
   endif()
   target_include_directories(trtmc_backend_trt

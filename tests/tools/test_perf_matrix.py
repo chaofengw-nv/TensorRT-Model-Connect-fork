@@ -2888,6 +2888,76 @@ def test_hf_runner_bridges_removed_input_check_decorator() -> None:
     assert GenericModule.check_model_inputs(forward) is forward
 
 
+def test_hf_runner_loads_model_directly_on_visible_gpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = runpy.run_path(str(REPOSITORY / "benchmarks/performance/baselines/hf_transformers.py"))
+    captured: dict[str, object] = {}
+
+    class FakeTokenizer:
+        pad_token_id = 0
+        eos_token_id = 1
+
+        @classmethod
+        def from_pretrained(cls, _model: str, **_options: object) -> "FakeTokenizer":
+            return cls()
+
+    class FakeModel:
+        config = Namespace(_commit_hash="snapshot")
+
+        @classmethod
+        def from_pretrained(cls, _model: str, **options: object) -> "FakeModel":
+            captured["load_options"] = options
+            return cls()
+
+        def eval(self) -> "FakeModel":
+            captured["eval"] = True
+            return self
+
+    fake_torch = ModuleType("torch")
+    fake_torch.float16 = "fp16"
+    fake_torch.float32 = "fp32"
+    fake_torch.bfloat16 = "bf16"
+    fake_transformers = ModuleType("transformers")
+    fake_transformers.AutoModel = FakeModel
+    fake_transformers.AutoModelForCausalLM = FakeModel
+    fake_transformers.AutoModelForSeq2SeqLM = FakeModel
+    fake_transformers.AutoTokenizer = FakeTokenizer
+    fake_cache_utils = ModuleType("transformers.cache_utils")
+    fake_cache_utils.DynamicCache = type("DynamicCache", (), {})
+    fake_generic = ModuleType("transformers.utils.generic")
+    fake_utils = ModuleType("transformers.utils")
+    fake_utils.generic = fake_generic
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    monkeypatch.setitem(sys.modules, "transformers.cache_utils", fake_cache_utils)
+    monkeypatch.setitem(sys.modules, "transformers.utils", fake_utils)
+
+    _tokenizer, model, revision = runner["_load"](
+        Namespace(
+            experts_implementation=None,
+            local_files_only=True,
+            model="microsoft/Phi-tiny-MoE-instruct",
+            model_class="task",
+            precision="fp16",
+            revision=None,
+            task="causal-lm",
+            trust_remote_code=True,
+        )
+    )
+
+    assert isinstance(model, FakeModel)
+    assert revision == "snapshot"
+    assert captured["eval"] is True
+    assert captured["load_options"] == {
+        "torch_dtype": "fp16",
+        "device_map": "cuda:0",
+        "low_cpu_mem_usage": True,
+        "trust_remote_code": True,
+        "local_files_only": True,
+    }
+
+
 def test_hf_runner_closes_ignored_disabled_thinking_prompt() -> None:
     runner = runpy.run_path(str(REPOSITORY / "benchmarks/performance/baselines/hf_transformers.py"))
     captured: dict[str, object] = {}

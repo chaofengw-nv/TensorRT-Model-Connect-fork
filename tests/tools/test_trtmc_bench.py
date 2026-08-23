@@ -203,6 +203,22 @@ def test_benchmark_uses_qualified_minitron_width_precision(tmp_path: Path) -> No
     assert command[revision_index + 1] == model.hf_revision
 
 
+def test_benchmark_forwards_phi_moe_dual_profile_layout(tmp_path: Path) -> None:
+    model = ManifestCatalog().resolve("phi-moe")
+    case = resolve_case(model, _bundle(tmp_path, model.bundle_name))
+
+    options = benchmark_builder._build_options(model, (case,))
+    command = benchmark_builder._build_command(
+        model,
+        case.bundle_path,
+        options,
+        benchmark_builder._BuilderRuntime("11.2", "11.2", "11.2"),
+    )
+
+    layout_index = command.index("--decoder-engine-layout")
+    assert command[layout_index + 1] == "dual_profile"
+
+
 def test_operation_registry_declares_supported_task_semantics() -> None:
     operations = {operation.name: operation for operation in registered_operations()}
     adapters = {adapter.task_strategy: adapter for adapter in registered_task_adapters()}
